@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: adpulse-ai-monitor
+    name: adpulse-ai-monitor-v2
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt

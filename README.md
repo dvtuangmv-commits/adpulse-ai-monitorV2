@@ -1,37 +1,27 @@
-# AdPulse AI Monitor V2
+# AdPulse AI Monitor V2.1
 
-Live-only ad monitoring dashboard for TikTok Ads and Meta Ads with 1h/3h/5h analysis windows, traceable diagnosis, CSV import, optional OpenAI explanation, and Sora 2 / Sora 2 Pro video generation.
+Dashboard theo dõi quảng cáo TikTok Ads / Meta Ads bằng dữ liệu API thật. Không cần upload CSV trong giao diện. Sau khi cấu hình credentials, hệ thống tự đồng bộ nền theo `POLL_SECONDS` (mặc định 300 giây) và cho phép xem cửa sổ phân tích 1h / 3h / 5h.
 
-## Deployment on Render
+## Nguồn dữ liệu
+- TikTok Ads API for Business v1.3: delivery metrics theo `stat_time_hour`; TikTok Shop purchase/value/ROAS giữ đúng độ phân giải mà API trả về.
+- Meta Marketing API Insights: campaign-level + hourly advertiser time-zone breakdown; purchase counts/value/ROAS chỉ hiển thị từ fields/actions/action_values/purchase_roas mà API trả về.
+- Không suy ra revenue từ ROAS. Thiếu dữ liệu nguồn thì hiển thị `—`/DATA_LIMITED.
 
-Build command:
-```
-pip install -r requirements.txt
-```
+## Render
+Build: `pip install -r requirements.txt`
+Start: `python app.py`
 
-Start command:
-```
-python app.py
-```
-
-## Required environment variables for real data
-
-TikTok:
+Environment variables:
 - `TIKTOK_ACCESS_TOKEN`
 - `TIKTOK_ADVERTISER_ID`
-
-Meta:
 - `META_ACCESS_TOKEN`
 - `META_AD_ACCOUNT_ID`
-- optional `META_GRAPH_VERSION` (defaults to v26.0 in this package)
+- `META_GRAPH_VERSION` (mặc định trong render.yaml)
+- `OPENAI_API_KEY` (AI explanation + Sora 2/Sora 2 Pro)
+- `OPENAI_MODEL` (mặc định `gpt-5`)
 
-OpenAI (optional for AI explanation/video):
-- `OPENAI_API_KEY`
-- optional `OPENAI_VIDEO_MODEL` (`sora-2` or `sora-2-pro`)
+## Video AI
+Module tạo video dùng OpenAI Videos API, nhận ảnh tham chiếu + prompt và chạy bất đồng bộ: submit job → theo dõi tiến độ → tải MP4 khi hoàn tất. Không giữ HTTP request mở trong lúc chờ render.
 
-## Data honesty rules
-
-- No synthetic/demo data is seeded.
-- 1h/3h/5h analysis uses hourly data only.
-- The app does not invent or interpolate conversion revenue/ROAS when the platform exposes those metrics at a coarser granularity.
-- Diagnosis is based first on measurable deltas versus the immediately preceding equivalent window. AI explanation is optional and is constrained to the provided observations.
+## CSV
+CSV import vẫn tồn tại như endpoint kỹ thuật dự phòng, nhưng không còn xuất hiện trên giao diện và không cần dùng cho vận hành bình thường.

@@ -75,6 +75,20 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+CREATE TABLE IF NOT EXISTS video_jobs (
+  job_id TEXT PRIMARY KEY,
+  provider_id TEXT,
+  status TEXT NOT NULL,
+  progress INTEGER DEFAULT 0,
+  model TEXT,
+  prompt TEXT,
+  seconds INTEGER,
+  size TEXT,
+  file_name TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 DEFAULT_SETTINGS = {
@@ -86,7 +100,7 @@ DEFAULT_SETTINGS = {
     "delta_alert_pct": "20",
     "target_roas_enabled": "0",
     "target_roas": "3",
-    "ai_model": "gpt-5.6-luna",
+    "ai_model": "gpt-5",
 }
 
 
@@ -550,7 +564,7 @@ def ai_analyze(payload):
     return text.strip()
 
 
-def openai_video(image_bytes,prompt,seconds=8,size="720x1280"):
+def openai_video(image_bytes,prompt,model="sora-2",seconds=8,size="720x1280"):
     key=os.getenv("OPENAI_API_KEY","").strip()
     if not key: raise RuntimeError("Thiếu OPENAI_API_KEY")
     ext=".png"; mime="image/png"
@@ -558,7 +572,7 @@ def openai_video(image_bytes,prompt,seconds=8,size="720x1280"):
         im=Image.open(io.BytesIO(image_bytes)); ext="."+(im.format or "PNG").lower(); mime=Image.MIME.get(im.format or "PNG","image/png")
     except Exception: pass
     files={"input_reference":(f"reference{ext}",image_bytes,mime)}
-    data={"model":os.getenv("OPENAI_VIDEO_MODEL","sora-2"),"prompt":prompt,"seconds":str(seconds),"size":size}
+    data={"model":model,"prompt":prompt,"seconds":str(seconds),"size":size}
     r=requests.post(f"{OPENAI_BASE}/videos",headers={"Authorization":f"Bearer {key}"},data=data,files=files,timeout=90)
     if r.status_code>=400: raise RuntimeError(f"OpenAI video HTTP {r.status_code}: {r.text[:600]}")
     return r.json()
@@ -579,6 +593,53 @@ def poll_openai_video(video_id, max_wait=180):
         if status in ('failed','cancelled'): raise RuntimeError((j.get('error') or {}).get('message') or f"Video status {status}")
         time.sleep(5)
     raise RuntimeError("Video generation chưa hoàn tất trong thời gian chờ 180 giây; hãy dùng video_id để poll lại.")
+
+
+def video_job_update(job_id, **fields):
+    if not fields:
+        return
+    fields["updated_at"] = iso_now()
+    c = db_conn()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [job_id]
+    c.execute(f"UPDATE video_jobs SET {cols} WHERE job_id=?", vals)
+    c.commit(); c.close()
+
+
+def video_job_get(job_id):
+    c = db_conn(); r = c.execute("SELECT * FROM video_jobs WHERE job_id=?", (job_id,)).fetchone(); c.close()
+    return dict(r) if r else None
+
+
+def video_worker(job_id, image_bytes, prompt, model, seconds, size):
+    try:
+        video_job_update(job_id, status="SUBMITTING", progress=0)
+        key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError("Thiếu OPENAI_API_KEY trong Render → Environment Variables")
+        created = openai_video(image_bytes, prompt, model=model, seconds=seconds, size=size)
+        provider_id = created.get("id")
+        if not provider_id:
+            raise RuntimeError("OpenAI không trả về video job id")
+        video_job_update(job_id, provider_id=provider_id, status=created.get("status", "queued").upper(), progress=int(created.get("progress") or 0))
+        deadline=time.time()+900
+        while time.time() < deadline:
+            r=requests.get(f"{OPENAI_BASE}/videos/{provider_id}",headers={"Authorization":f"Bearer {key}"},timeout=40)
+            if r.status_code>=400: raise RuntimeError(f"OpenAI video status HTTP {r.status_code}: {r.text[:500]}")
+            j=r.json(); st=(j.get("status") or "").lower(); prog=int(j.get("progress") or 0)
+            if st == "completed":
+                rr=requests.get(f"{OPENAI_BASE}/videos/{provider_id}/content",headers={"Authorization":f"Bearer {key}"},timeout=180)
+                if rr.status_code>=400: raise RuntimeError(f"OpenAI content HTTP {rr.status_code}: {rr.text[:500]}")
+                fn=f"sora_{provider_id}.mp4"; (MEDIA/fn).write_bytes(rr.content)
+                video_job_update(job_id,status="COMPLETED",progress=100,file_name=fn)
+                return
+            if st in ("failed","cancelled"):
+                raise RuntimeError((j.get("error") or {}).get("message") or f"Video status {st}")
+            video_job_update(job_id,status=st.upper() or "PROCESSING",progress=prog)
+            time.sleep(5)
+        raise RuntimeError("Video generation chưa hoàn tất sau 15 phút. Job vẫn tồn tại trên OpenAI; có thể kiểm tra bằng provider_id.")
+    except Exception as e:
+        video_job_update(job_id,status="FAILED",error=str(e),progress=0)
 
 
 def import_csv_text(text, platform, mapping=None):
@@ -619,12 +680,12 @@ def env_status():
     }
 
 HTML = r'''<!doctype html>
-<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AdPulse AI Monitor V2</title>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AdPulse AI Monitor V2.1</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
 :root{--bg:#07111e;--card:#0d1b2c;--card2:#132742;--line:#203754;--text:#edf5ff;--muted:#91a8c5;--blue:#65a8ff;--green:#39d58a;--warn:#ffbf69;--bad:#ff7180}*{box-sizing:border-box}body{margin:0;background:linear-gradient(140deg,#06101b,#0a1524 60%,#0e1b2d);color:var(--text);font:14px Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial}header{position:sticky;top:0;z-index:10;background:rgba(6,16,27,.94);backdrop-filter:blur(12px);border-bottom:1px solid var(--line);padding:16px 22px;display:flex;align-items:center;justify-content:space-between}.brand{font-size:20px;font-weight:850}.brand span{color:var(--blue)}.status{padding:7px 10px;border-radius:999px;border:1px solid #2a4663;color:var(--muted);font-size:12px}main{max-width:1550px;margin:auto;padding:20px}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.seg{display:flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}.seg button{border:0;background:transparent;color:var(--muted);padding:10px 15px;cursor:pointer}.seg button.active{background:var(--blue);color:#06111e;font-weight:800}.btn,.select,input,textarea{background:#0b1727;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:10px 12px}.btn{cursor:pointer}.btn.primary{background:var(--blue);color:#06111e;border-color:var(--blue);font-weight:800}.spacer{flex:1}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-top:16px}.kpi{background:linear-gradient(160deg,var(--card),#0a1728);border:1px solid var(--line);border-radius:14px;padding:14px;min-height:112px}.kpi .label{font-size:12px;color:var(--muted)}.kpi .v{font-size:25px;font-weight:850;margin-top:9px}.kpi .sub{font-size:11px;color:var(--muted);margin-top:3px}.layout{display:grid;grid-template-columns:1.6fr 1fr;gap:16px}.panel{background:rgba(13,27,44,.9);border:1px solid var(--line);border-radius:14px;padding:16px;margin-top:16px}.panel h3{margin:0 0 12px;font-size:14px}.chart{height:320px}.table{width:100%;border-collapse:collapse;font-size:12px}.table th,.table td{padding:10px 8px;border-bottom:1px solid #1b2d45;text-align:left;white-space:nowrap}.table th{color:var(--muted)}.tag{display:inline-block;border-radius:7px;padding:4px 7px;font-size:10px;font-weight:800}.OK{background:#133725;color:#99efbf}.HIGH{background:#4b3418;color:#ffd08f}.CRITICAL{background:#511a24;color:#ffb3bc}.DATA_LIMITED{background:#2a3040;color:#cfd9e7}.muted{color:var(--muted)}.issue{border:1px solid var(--line);padding:12px;border-radius:12px;background:#0b1727;margin:8px 0}.issue .row{margin-top:6px;line-height:1.5;font-size:12px}.note{color:var(--muted);font-size:11px;line-height:1.55}.form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.form label{font-size:11px;color:var(--muted)}.form input,.form textarea{width:100%;margin-top:5px}.full{grid-column:1/-1}.dataBadge{font-size:10px;color:#8db7e8}.error{color:#ff9aa5}.success{color:#98f0bd}.hidden{display:none}.footer{text-align:center;color:#66809f;font-size:11px;padding:20px}.sourceBox{display:grid;grid-template-columns:1fr 1fr;gap:12px}.sourceCard{border:1px solid var(--line);border-radius:12px;padding:13px;background:#0b1727}.sourceCard h4{margin:0 0 8px}.sourceCard code{font-size:10px}.smallgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.alertline{padding:8px 10px;border-radius:9px;background:#0a1625;border:1px solid var(--line);font-size:11px;margin-top:8px}@media(max-width:1150px){.grid{grid-template-columns:repeat(3,1fr)}.layout{grid-template-columns:1fr}}@media(max-width:680px){main{padding:12px}.grid{grid-template-columns:repeat(2,1fr)}.form,.sourceBox,.smallgrid{grid-template-columns:1fr}}
 </style></head><body>
-<header><div class="brand">AdPulse <span>AI Monitor V2</span></div><div class="status" id="status">ĐANG KIỂM TRA...</div></header>
+<header><div class="brand">AdPulse <span>AI Monitor V2.1</span></div><div class="status" id="status">ĐANG KIỂM TRA...</div></header>
 <main>
 <div class="toolbar"><div class="seg"><button class="win active" data-w="1">1h</button><button class="win" data-w="3">3h</button><button class="win" data-w="5">5h</button></div><span class="muted">Polling <b id="pollTxt">300s</b></span><button class="btn" onclick="syncNow()">↻ Đồng bộ dữ liệu thật</button><button class="btn" onclick="location.href='#sources'">Nguồn dữ liệu</button><div class="spacer"></div><button class="btn primary" onclick="location.href='#video'">+ Tạo video AI</button></div>
 <div id="banner" class="panel"></div>
@@ -634,9 +695,9 @@ HTML = r'''<!doctype html>
 <div class="panel"><h3>Phân tích: vấn đề → bằng chứng → giả thuyết → kiểm tra</h3><div id="diagnosis"></div></div>
 <div class="panel"><h3>Thiết lập guardrail</h3><div class="form"><div><label>Delta cảnh báo (%)</label><input id="delta_alert_pct" type="number"></div><div><label>Min spend cửa sổ (VNĐ)</label><input id="min_spend_for_alert" type="number"></div><div><label>Min clicks cửa sổ</label><input id="min_clicks_for_alert" type="number"></div><div><label>Baseline hours</label><input id="baseline_hours" type="number"></div><div><label>Target ROAS (business target)</label><input id="target_roas" type="number" step="0.1"></div><div><label>Target ROAS enabled (0/1)</label><input id="target_roas_enabled" type="number" min="0" max="1"></div><div><label>Polling seconds</label><input id="poll_seconds" type="number"></div></div><br><button class="btn primary" onclick="saveSettings()">Lưu cấu hình</button><p class="note">Guardrail không phải benchmark thị trường. Các cảnh báo mặc định dựa trên biến động so với cửa sổ trước cùng độ dài. Target ROAS chỉ có hiệu lực khi bạn chủ động bật.</p></div>
 <div class="panel" id="sources"><h3>Kết nối dữ liệu thật</h3><div class="sourceBox"><div class="sourceCard"><h4>TikTok Ads</h4><div id="ttState" class="muted">...</div><p class="note">Render Environment Variables:</p><code>TIKTOK_ACCESS_TOKEN</code><br><code>TIKTOK_ADVERTISER_ID</code><p class="note">Bản này dùng TikTok API for Business reporting. Delivery metrics lấy theo giờ; TikTok Shop purchase/revenue/ROAS giữ nguyên độ phân giải nền tảng hỗ trợ, không bịa số theo giờ.</p></div><div class="sourceCard"><h4>Meta Ads</h4><div id="metaState" class="muted">...</div><p class="note">Render Environment Variables:</p><code>META_ACCESS_TOKEN</code><br><code>META_AD_ACCOUNT_ID</code><br><code>META_GRAPH_VERSION</code><p class="note">Meta Insights dùng breakdown theo giờ của advertiser time zone. Purchase/revenue lấy từ action/action_values/purchase_roas khi nền tảng trả về.</p></div><div class="sourceCard"><h4>OpenAI</h4><div id="aiState" class="muted">...</div><p class="note">Render Environment Variable:</p><code>OPENAI_API_KEY</code><p class="note">Dùng cho AI explanation và Sora 2 video generation. API key chỉ nằm ở server.</p></div></div></div>
-<div class="panel"><h3>Import CSV dữ liệu thật (dự phòng)</h3><input id="csvFile" type="file" accept=".csv,text/csv"><select id="csvPlatform" class="select"><option>TikTok</option><option>Meta</option></select><button class="btn" onclick="importCSV()">Import CSV</button><div id="csvMsg" class="note"></div></div>
+<div class="panel"><h3>Dữ liệu thật — tự động, không cần upload CSV</h3><p class="note">Sau khi cấu hình credentials trong Render, hệ thống tự gọi TikTok Ads/Meta Ads API theo chu kỳ polling và lưu timestamp + nguồn dữ liệu. Nút “Đồng bộ dữ liệu thật” chỉ dùng khi bạn muốn kéo dữ liệu ngay lập tức. CSV không bắt buộc và đã bỏ khỏi giao diện.</p><div class="smallgrid"><div class="sourceCard"><b>Live API</b><div class="note">Tự đồng bộ nền</div></div><div class="sourceCard"><b>1h / 3h / 5h</b><div class="note">So sánh theo cửa sổ dữ liệu đã có</div></div><div class="sourceCard"><b>No fabrication</b><div class="note">Thiếu dữ liệu nguồn → hiển thị thiếu dữ liệu</div></div></div></div>
 <div class="panel" id="video"><h3>AI Video — Sora 2 + ảnh tham chiếu</h3><div class="form"><div class="full"><label>Ảnh sản phẩm</label><input id="img" type="file" accept="image/*"></div><div class="full"><label>Prompt</label><textarea id="prompt">Video quảng cáo dọc 9:16 cho sản phẩm boxer nam, giữ đúng hình dáng và màu sắc sản phẩm từ ảnh tham chiếu, camera chuyển động mượt, premium, realistic, clean ecommerce lighting, nhấn mạnh chất liệu ice silk/siêu mềm và co giãn 4 chiều.</textarea></div><div><label>Model</label><select id="videoModel" class="select" style="width:100%"><option value="sora-2">Sora 2</option><option value="sora-2-pro">Sora 2 Pro</option></select></div><div><label>Seconds</label><select id="videoSeconds" class="select" style="width:100%"><option value="4">4</option><option value="8" selected>8</option><option value="12">12</option></select></div><div><label>Size</label><select id="videoSize" class="select" style="width:100%"><option value="720x1280" selected>720x1280</option><option value="1280x720">1280x720</option><option value="1024x1792">1024x1792</option><option value="1792x1024">1792x1024</option></select></div><div style="display:flex;align-items:end"><button class="btn primary" style="width:100%" onclick="makeVideo()">Generate video</button></div></div><div id="videoOut" class="note"></div></div>
-<div class="footer">AdPulse AI Monitor V2 • Live-only • Không seed dữ liệu giả • Phân tích có nguồn và độ phân giải dữ liệu</div>
+<div class="footer">AdPulse AI Monitor V2.1 • Auto API sync • Không cần upload CSV • Không seed dữ liệu giả</div>
 </main>
 <script>
 let windowHours=1,timer=null;
@@ -652,9 +713,8 @@ async function load(){try{const j=await api('/api/dashboard?window='+windowHours
 function plot(ds){const names=ds.map(d=>d.name),r=ds.map(d=>d.attributed_roas_available);Plotly.react('roasChart',[{x:names,y:r,type:'bar',text:r.map(v=>v==null?'':v.toFixed(2)+'x'),textposition:'auto'}],{margin:{l:35,r:10,t:10,b:90},paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'#cbd8ea'},yaxis:{title:'Platform ROAS'},xaxis:{tickangle:-35}},{displayModeBar:false});Plotly.react('spendChart',[{x:names,y:ds.map(d=>d.spend),type:'bar',name:'Spend'},{x:names,y:ds.map(d=>d.attributed_revenue_available||0),type:'bar',name:'Attributed revenue (available granularity)'}],{barmode:'group',margin:{l:55,r:10,t:10,b:90},paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'#cbd8ea'},yaxis:{title:'VNĐ'},xaxis:{tickangle:-35}},{displayModeBar:false})}
 async function syncNow(){document.getElementById('status').textContent='ĐANG ĐỒNG BỘ...';try{const j=await api('/api/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});document.getElementById('status').textContent='ĐỒNG BỘ XONG';load()}catch(e){document.getElementById('status').textContent='SYNC ERROR';alert(e.message)}}
 async function saveSettings(){const b={};['delta_alert_pct','min_spend_for_alert','min_clicks_for_alert','baseline_hours','target_roas','target_roas_enabled','poll_seconds'].forEach(k=>b[k]=document.getElementById(k).value);await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});load()}
-async function importCSV(){const f=document.getElementById('csvFile').files[0];if(!f){alert('Chọn CSV');return}const text=await f.text();const j=await api('/api/import_csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:document.getElementById('csvPlatform').value,text})});document.getElementById('csvMsg').textContent='Đã import '+j.rows+' dòng dữ liệu thật.';load()}
 async function askAI(d){const id='ai_'+d.campaign_key.replace(/[^a-z0-9]/gi,'_');document.getElementById(id).textContent='AI đang phân tích...';try{const j=await api('/api/ai/diagnose',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});document.getElementById(id).textContent=j.text}catch(e){document.getElementById(id).textContent='AI error: '+e.message}}
-async function makeVideo(){const f=document.getElementById('img').files[0];if(!f){alert('Chọn ảnh');return}document.getElementById('videoOut').textContent='Đang tạo video...';const b64=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=rej;r.readAsDataURL(f)});try{const j=await api('/api/video',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_base64:b64,prompt:document.getElementById('prompt').value,model:document.getElementById('videoModel').value,seconds:Number(document.getElementById('videoSeconds').value),size:document.getElementById('videoSize').value})});document.getElementById('videoOut').innerHTML=`<video controls style="width:100%;max-width:520px;border-radius:12px;margin-top:12px" src="/media/${j.file}"></video><div class="note"><a href="/media/${j.file}" download>Tải MP4</a></div>`}catch(e){document.getElementById('videoOut').textContent='Video error: '+e.message}}
+async function makeVideo(){const f=document.getElementById('img').files[0];if(!f){alert('Chọn ảnh');return}document.getElementById('videoOut').textContent='Đang gửi job video...';const b64=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=rej;r.readAsDataURL(f)});try{const j=await api('/api/video',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_base64:b64,prompt:document.getElementById('prompt').value,model:document.getElementById('videoModel').value,seconds:Number(document.getElementById('videoSeconds').value),size:document.getElementById('videoSize').value})});const poll=async()=>{const s=await api('/api/video_status?id='+encodeURIComponent(j.job_id));document.getElementById('videoOut').textContent='Video: '+s.status+' · '+(s.progress||0)+'%';if(s.status==='COMPLETED'){document.getElementById('videoOut').innerHTML=`<video controls style="width:100%;max-width:520px;border-radius:12px;margin-top:12px" src="/media/${s.file_name}"></video><div class="note"><a href="/media/${s.file_name}" download>Tải MP4</a><br>OpenAI video id: ${s.provider_id||'—'}</div>`;return}if(s.status==='FAILED'){document.getElementById('videoOut').textContent='Video error: '+(s.error||'Unknown error');return}setTimeout(poll,5000)};poll()}catch(e){document.getElementById('videoOut').textContent='Video error: '+e.message}}
 document.querySelectorAll('.win').forEach(b=>b.onclick=()=>{document.querySelectorAll('.win').forEach(x=>x.classList.remove('active'));b.classList.add('active');windowHours=Number(b.dataset.w);load()});load();
 </script></body></html>'''
 
@@ -672,9 +732,15 @@ class Handler(BaseHTTPRequestHandler):
             fn=os.path.basename(p.path);fp=MEDIA/fn
             if not fp.exists():self.send_error(404);return
             data=fp.read_bytes();self.send_response(200);self.send_header('Content-Type',mimetypes.guess_type(str(fp))[0] or 'application/octet-stream');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data);return
+        if p.path=='/api/video_status':
+            q=parse_qs(p.query); job_id=(q.get('id',[''])[0] or '').strip();
+            if not job_id: self.json({'error':'Thiếu job id'},400); return
+            job=video_job_get(job_id)
+            if not job: self.json({'error':'Không tìm thấy video job'},404); return
+            self.json(job); return
         if p.path=='/api/dashboard':
             q=parse_qs(p.query); w=int(q.get('window',['1'])[0]); data,diag,anchor=build_dashboard(w); overall=overall_metrics(get_rows(w,None,True)[0]); syncs,errors=latest_syncs(); env=env_status(); configured=any(v['configured'] for v in env.values() if isinstance(v,dict)); status='LIVE DATA' if data else ('READY — CHỜ KẾT NỐI' if not configured else 'CONNECTED — CHƯA CÓ DỮ LIỆU')
-            note='Số liệu chỉ hiển thị từ API/CSV bạn kết nối. Phân tích cửa sổ 1h/3h/5h dùng dữ liệu hourly. TikTok Shop conversion/revenue/ROAS có thể chỉ được nền tảng cung cấp ở granularity ngày; hệ thống giữ nguyên granularity đó, không nội suy.'
+            note='Số liệu được lấy tự động từ API của nền tảng khi credentials hợp lệ; CSV chỉ là phương án dự phòng qua API nội bộ và không cần dùng trong giao diện. Phân tích cửa sổ 1h/3h/5h dùng dữ liệu hourly. TikTok Shop conversion/revenue/ROAS có thể chỉ được nền tảng cung cấp ở granularity ngày; hệ thống giữ nguyên granularity đó, không nội suy.'
             self.json({'status':status,'settings':get_settings(),'overall':overall,'data':data,'diag':diag,'anchor':anchor.isoformat() if anchor else None,'syncs':syncs,'errors':errors,'env':env,'sourceNote':note});return
         self.send_error(404)
     def do_POST(self):
@@ -688,9 +754,15 @@ class Handler(BaseHTTPRequestHandler):
             if p.path=='/api/import_csv':
                 rows=import_csv_text(body.get('text',''),body.get('platform','CSV'));self.json({'ok':True,'rows':rows});return
             if p.path=='/api/video':
-                img=base64.b64decode(body.get('image_base64',''));prompt=body.get('prompt','');model=body.get('model','sora-2');seconds=int(body.get('seconds',8));size=body.get('size','720x1280');
-                os.environ['OPENAI_VIDEO_MODEL']=model
-                job=openai_video(img,prompt,seconds,size); result=poll_openai_video(job['id']); self.json({'ok':True,**result,'job_id':job['id']});return
+                img=base64.b64decode(body.get('image_base64',''));prompt=body.get('prompt','').strip();model=body.get('model','sora-2');seconds=int(body.get('seconds',8));size=body.get('size','720x1280');
+                if not img: raise RuntimeError('Thiếu ảnh tham chiếu')
+                if not prompt: raise RuntimeError('Thiếu prompt')
+                if not os.getenv('OPENAI_API_KEY','').strip(): raise RuntimeError('Thiếu OPENAI_API_KEY trong Render → Environment Variables')
+                import uuid
+                jid='local_'+uuid.uuid4().hex
+                t=iso_now(); c=db_conn(); c.execute("INSERT INTO video_jobs(job_id,status,progress,model,prompt,seconds,size,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(jid,'QUEUED',0,model,prompt,seconds,size,t,t)); c.commit(); c.close()
+                threading.Thread(target=video_worker,args=(jid,img,prompt,model,seconds,size),daemon=True).start()
+                self.json({'ok':True,'job_id':jid});return
             self.send_error(404)
         except Exception as e:self.json({'error':str(e)},500)
     def log_message(self,*args):pass
