@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: adpulse-ai-monitor
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: TIKTOK_ACCESS_TOKEN
+        sync: false
+      - key: TIKTOK_ADVERTISER_ID
+        sync: false
+      - key: META_ACCESS_TOKEN
+        sync: false
+      - key: META_AD_ACCOUNT_ID
+        sync: false
+      - key: META_GRAPH_VERSION
+        value: v26.0
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VIDEO_MODEL
+        value: sora-2
